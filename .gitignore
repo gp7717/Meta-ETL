@@ -17,7 +17,7 @@ bin/
 obj/
 
 # VSCode and IDEs
-.vscode/
+
 .idea/
 
 # macOS

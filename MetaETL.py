@@ -26,19 +26,19 @@ DB_URL = os.getenv('DATABASE_URL')
 if DB_URL:
     parsed_url = urlparse(DB_URL)
     DB_CONFIG = {
-        'host': parsed_url.hostname or 'selericdb.postgres.database.azure.com',
-        'port': parsed_url.port or 5432,
-        'database': parsed_url.path.lstrip('/') or 'postgres',
-        'user': parsed_url.username or 'admin_seleric',
-        'password': parsed_url.password or 'Seleric789'
+        'host': parsed_url.hostname or os.getenv('DB_HOST'),
+        'port': parsed_url.port or int(os.getenv('DB_PORT', 5432)),
+        'database': parsed_url.path.lstrip('/') or os.getenv('DB_NAME'),
+        'user': parsed_url.username or os.getenv('DB_USER'),
+        'password': parsed_url.password or os.getenv('DB_PASSWORD')
     }
 else:
     DB_CONFIG = {
-        'host': os.getenv('DB_HOST', 'selericdb.postgres.database.azure.com'),
+        'host': os.getenv('DB_HOST'),
         'port': int(os.getenv('DB_PORT', 5432)),
-        'database': os.getenv('DB_NAME', 'postgres'),
-        'user': os.getenv('DB_USER', 'admin_seleric'),
-        'password': os.getenv('DB_PASSWORD', 'Seleric789')
+        'database': os.getenv('DB_NAME'),
+        'user': os.getenv('DB_USER'),
+        'password': os.getenv('DB_PASSWORD')
     }
 
 logger.info(f"Database configuration: host={DB_CONFIG['host']}, port={DB_CONFIG['port']}, database={DB_CONFIG['database']}, user={DB_CONFIG['user']}")
