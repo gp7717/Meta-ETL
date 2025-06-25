@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.python_packages/
+
 
 # Environment and secrets
 .env

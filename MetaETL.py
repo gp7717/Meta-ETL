@@ -94,6 +94,37 @@ CAMPAIGN_SCHEMA = {
     'end_time': {'type': 'string', 'nullable': True, 'format': 'datetime'}
 }
 
+# --- BEGIN: Ad Insights Hourly Snapshot Schema and Table ---
+AD_INSIGHTS_HOURLY_SNAPSHOT_SCHEMA = {
+    'snapshot_hour': {'type': 'string', 'required': True, 'format': 'datetime'},
+    'ad_id': {'type': 'string', 'required': True},
+    'adset_id': {'type': 'string', 'required': True},
+    'campaign_id': {'type': 'string', 'required': True},
+    'account_id': {'type': 'string', 'required': True},
+    'date_start': {'type': 'string', 'required': True, 'format': 'date'},
+    'date_stop': {'type': 'string', 'required': True, 'format': 'date'},
+    'clicks': {'type': 'integer', 'nullable': True},
+    'impressions': {'type': 'integer', 'nullable': True},
+    'spend': {'type': 'number', 'nullable': True},
+    'reach': {'type': 'integer', 'nullable': True},
+    'page_engagement': {'type': 'integer', 'nullable': True},
+    'post_engagement': {'type': 'integer', 'nullable': True},
+    'video_view': {'type': 'integer', 'nullable': True},
+    'landing_page_view': {'type': 'integer', 'nullable': True},
+    'purchase': {'type': 'integer', 'nullable': True},
+    'add_to_cart': {'type': 'integer', 'nullable': True},
+    'link_click': {'type': 'integer', 'nullable': True},
+    'post_reaction': {'type': 'integer', 'nullable': True},
+    'outbound_click': {'type': 'integer', 'nullable': True},
+    'purchase_value': {'type': 'number', 'nullable': True},
+    'view_content_value': {'type': 'number', 'nullable': True},
+    'add_to_cart_value': {'type': 'number', 'nullable': True},
+    'ctr': {'type': 'number', 'nullable': True},
+    'cpp': {'type': 'number', 'nullable': True},
+    'video_p25_watched': {'type': 'integer', 'nullable': True},
+    'video_thruplay_watched': {'type': 'integer', 'nullable': True}
+}
+
 CREATE_TABLES_SQL = [
     """
     CREATE TABLE IF NOT EXISTS dim_campaign (
@@ -218,6 +249,47 @@ CREATE_TABLES_SQL = [
         fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         raw_data JSONB,
         PRIMARY KEY (id, hour)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ad_insights_hourly_snapshots (
+        id SERIAL PRIMARY KEY,
+        snapshot_hour TIMESTAMP NOT NULL,
+        ad_id VARCHAR(50) NOT NULL,
+        adset_id VARCHAR(50),
+        campaign_id VARCHAR(50),
+        account_id VARCHAR(50),
+        date_start DATE,
+        date_stop DATE,
+        clicks INTEGER,
+        impressions INTEGER,
+        spend NUMERIC,
+        reach INTEGER,
+        page_engagement INTEGER,
+        post_engagement INTEGER,
+        video_view INTEGER,
+        landing_page_view INTEGER,
+        purchase INTEGER,
+        add_to_cart INTEGER,
+        link_click INTEGER,
+        post_reaction INTEGER,
+        outbound_click INTEGER,
+        purchase_value NUMERIC,
+        view_content_value NUMERIC,
+        add_to_cart_value NUMERIC,
+        ctr NUMERIC,
+        cpp NUMERIC,
+        video_p25_watched INTEGER,
+        video_thruplay_watched INTEGER,
+        roas NUMERIC GENERATED ALWAYS AS (CASE WHEN spend > 0 THEN purchase_value / spend ELSE 0 END) STORED,
+        calc_ctr NUMERIC GENERATED ALWAYS AS (CASE WHEN impressions > 0 THEN clicks::NUMERIC / impressions * 100 ELSE 0 END) STORED,
+        calc_cpp NUMERIC GENERATED ALWAYS AS (CASE WHEN purchase > 0 THEN spend / purchase ELSE 0 END) STORED,
+        calc_cpr NUMERIC GENERATED ALWAYS AS (CASE WHEN reach > 0 THEN spend / reach ELSE 0 END) STORED,
+        hook_rate NUMERIC GENERATED ALWAYS AS (CASE WHEN impressions > 0 THEN page_engagement::NUMERIC / impressions * 100 ELSE 0 END) STORED,
+        hold_rate NUMERIC GENERATED ALWAYS AS (CASE WHEN page_engagement > 0 THEN video_view::NUMERIC / page_engagement * 100 ELSE 0 END) STORED,
+        conversion_rate NUMERIC GENERATED ALWAYS AS (CASE WHEN landing_page_view > 0 THEN purchase::NUMERIC / landing_page_view * 100 ELSE 0 END) STORED,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(snapshot_hour, ad_id, date_start, date_stop)
     )
     """
 ]
@@ -598,6 +670,20 @@ def fetch_adsets_batch():
     logger.info(f"Fetched {len(all_adsets)} adsets in total")
     return all_adsets
 
+def filter_adsets_with_existing_campaigns(adsets, conn):
+    if not adsets:
+        return []
+    cursor = conn.cursor()
+    cursor.execute("SELECT campaign_id FROM dim_campaign")
+    existing_campaign_ids = set(row[0] for row in cursor.fetchall())
+    # adset[2] is campaign_id in the adsets tuple structure
+    filtered = [adset for adset in adsets if adset[2] in existing_campaign_ids]
+    missing = [adset for adset in adsets if adset[2] not in existing_campaign_ids]
+    if missing:
+        logger.warning(f"Filtered out {len(missing)} adsets with missing campaign_id(s): {[adset[2] for adset in missing]}")
+    cursor.close()
+    return filtered
+
 def upsert_adsets(adsets, conn):
     if not adsets:
         return
@@ -722,6 +808,127 @@ def upsert_ads(ads, conn):
     finally:
         cursor.close()
 
+def fetch_ad_insights(ad_ids):
+    if not ad_ids:
+        return []
+    url = f"{BASE_URL}/act_{ACCOUNT_ID}/insights"
+    params = {
+        'access_token': ACCESS_TOKEN,
+        'level': 'ad',
+        'filtering': json.dumps([{'field': 'ad.id', 'operator': 'IN', 'value': ad_ids}]),
+        'date_preset': 'today',
+        'action_breakdowns': 'action_type',
+        'fields': 'ad_id,adset_id,campaign_id,account_id,date_start,date_stop,clicks,impressions,spend,reach,actions,action_values,outbound_clicks,ctr,cpp,video_p25_watched_actions,video_thruplay_watched_actions'
+    }
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json().get('data', [])
+        processed_insights = []
+        for insight in data:
+            # Convert string values to correct types
+            try:
+                if 'clicks' in insight:
+                    insight['clicks'] = int(insight['clicks']) if insight['clicks'] else 0
+                if 'impressions' in insight:
+                    insight['impressions'] = int(insight['impressions']) if insight['impressions'] else 0
+                if 'reach' in insight:
+                    insight['reach'] = int(insight['reach']) if insight['reach'] else 0
+                if 'spend' in insight:
+                    insight['spend'] = float(insight['spend']) if insight['spend'] else 0.0
+                if 'ctr' in insight:
+                    insight['ctr'] = float(insight['ctr']) if insight['ctr'] else 0.0
+                if 'cpp' in insight:
+                    insight['cpp'] = float(insight['cpp']) if insight['cpp'] else 0.0
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Type conversion failed for insight {insight.get('ad_id', 'unknown')}: {e}")
+                continue  # Skip insight if conversion fails
+            processed_insights.append(insight)
+        logger.info(f"Fetched {len(processed_insights)} insights (validation deferred)")
+        return processed_insights
+    except Exception as e:
+        logger.error(f"Error fetching ad insights: {e}")
+        return []
+
+def upsert_hourly_ad_insights(insights, conn):
+    if not insights:
+        logger.warning("No insights to upsert into ad_insights_hourly_snapshots")
+        return
+    cursor = conn.cursor()
+    cursor.execute("SET TIME ZONE 'Asia/Kolkata';")
+    current_hour_ist = datetime.now(IST).replace(minute=0, second=0, microsecond=0)
+    query = """
+    INSERT INTO ad_insights_hourly_snapshots (
+        snapshot_hour, ad_id, adset_id, campaign_id, account_id, date_start, date_stop,
+        clicks, impressions, spend, reach, page_engagement, post_engagement, video_view, landing_page_view,
+        purchase, add_to_cart, link_click, post_reaction, outbound_click, purchase_value, view_content_value,
+        add_to_cart_value, ctr, cpp, video_p25_watched, video_thruplay_watched, created_at
+    ) VALUES %s
+    ON CONFLICT (snapshot_hour, ad_id, date_start, date_stop) DO UPDATE SET
+        clicks=EXCLUDED.clicks, impressions=EXCLUDED.impressions, spend=EXCLUDED.spend, reach=EXCLUDED.reach,
+        page_engagement=EXCLUDED.page_engagement, post_engagement=EXCLUDED.post_engagement, video_view=EXCLUDED.video_view,
+        landing_page_view=EXCLUDED.landing_page_view, purchase=EXCLUDED.purchase, add_to_cart=EXCLUDED.add_to_cart,
+        link_click=EXCLUDED.link_click, post_reaction=EXCLUDED.post_reaction, outbound_click=EXCLUDED.outbound_click,
+        purchase_value=EXCLUDED.purchase_value, view_content_value=EXCLUDED.view_content_value, add_to_cart_value=EXCLUDED.add_to_cart_value,
+        ctr=EXCLUDED.ctr, cpp=EXCLUDED.cpp, video_p25_watched=EXCLUDED.video_p25_watched, video_thruplay_watched=EXCLUDED.video_thruplay_watched,
+        created_at=NOW()
+    """
+    values = []
+    valid_count = 0
+    for insight in insights:
+        try:
+            insight['snapshot_hour'] = current_hour_ist.isoformat()
+            errors = validate_schema(insight, AD_INSIGHTS_HOURLY_SNAPSHOT_SCHEMA)
+            if errors:
+                logger.warning(f"Schema validation failed for insight {insight.get('ad_id', 'unknown')}: {errors}")
+                continue
+            values.append((
+                current_hour_ist,
+                insight.get('ad_id'),
+                insight.get('adset_id'),
+                insight.get('campaign_id'),
+                insight.get('account_id'),
+                insight.get('date_start'),
+                insight.get('date_stop'),
+                int(insight.get('clicks', 0)),
+                int(insight.get('impressions', 0)),
+                float(insight.get('spend', 0)),
+                int(insight.get('reach', 0)),
+                insight.get('page_engagement', 0),
+                insight.get('post_engagement', 0),
+                insight.get('video_view', 0),
+                insight.get('landing_page_view', 0),
+                insight.get('purchase', 0),
+                insight.get('add_to_cart', 0),
+                insight.get('link_click', 0),
+                insight.get('post_reaction', 0),
+                insight.get('outbound_click', 0),
+                insight.get('purchase_value', 0.0),
+                insight.get('view_content_value', 0.0),
+                insight.get('add_to_cart_value', 0.0),
+                float(insight.get('ctr', 0)),
+                float(insight.get('cpp', 0)),
+                insight.get('video_p25_watched', 0),
+                insight.get('video_thruplay_watched', 0),
+                datetime.now(IST)
+            ))
+            valid_count += 1
+        except Exception as e:
+            logger.warning(f"Failed to prepare insight for upsert: {e}")
+            continue
+    try:
+        if values:
+            execute_values(cursor, query, values)
+            conn.commit()
+            logger.info(f"Upserted {valid_count} hourly ad insights into ad_insights_hourly_snapshots")
+        else:
+            logger.warning("No valid insights to upsert into ad_insights_hourly_snapshots")
+    except Exception as e:
+        logger.error(f"Failed to upsert hourly ad insights: {str(e)}")
+        raise
+    finally:
+        cursor.close()
+
 def main():
     setup_database()
     conn = None
@@ -790,6 +997,7 @@ def main():
         try:
             logger.info("Starting AdSets ETL step")
             adsets = fetch_adsets_batch()
+            adsets = filter_adsets_with_existing_campaigns(adsets, conn)
             upsert_adsets(adsets, conn)
             logger.info("AdSets ETL step completed successfully")
         except Exception as e:
@@ -802,6 +1010,53 @@ def main():
             logger.info("Ads ETL step completed successfully")
         except Exception as e:
             logger.error(f"Ads ETL step failed: {e}")
+            ads = []  # Ensure ads is always defined
+
+        # Hourly Ad Insights ETL (direct to snapshots)
+        try:
+            logger.info("Starting Hourly Ad Insights ETL step (direct to ad_insights_hourly_snapshots)")
+            insights = fetch_ad_insights([a[0] for a in ads])
+            # Add default insights for ads with no insight
+            ad_id_to_ad = {a[0]: a for a in ads}  # a[0] is ad_id
+            insight_ad_ids = set(i['ad_id'] for i in insights)
+            all_ad_ids = set(ad_id_to_ad.keys())
+            today_str = datetime.now(IST).date().isoformat()
+            for missing_ad_id in all_ad_ids - insight_ad_ids:
+                ad = ad_id_to_ad[missing_ad_id]
+                # ad tuple: (ad_id, name, adset_id, targeting, insights, hour, fetched_at, raw_data)
+                default_insight = {
+                    'ad_id': ad[0],
+                    'adset_id': ad[2],
+                    'campaign_id': None,
+                    'account_id': None,
+                    'date_start': today_str,
+                    'date_stop': today_str,
+                    'clicks': 0,
+                    'impressions': 0,
+                    'spend': 0.0,
+                    'reach': 0,
+                    'page_engagement': 0,
+                    'post_engagement': 0,
+                    'video_view': 0,
+                    'landing_page_view': 0,
+                    'purchase': 0,
+                    'add_to_cart': 0,
+                    'link_click': 0,
+                    'post_reaction': 0,
+                    'outbound_click': 0,
+                    'purchase_value': 0.0,
+                    'view_content_value': 0.0,
+                    'add_to_cart_value': 0.0,
+                    'ctr': 0.0,
+                    'cpp': 0.0,
+                    'video_p25_watched': 0,
+                    'video_thruplay_watched': 0
+                }
+                insights.append(default_insight)
+            upsert_hourly_ad_insights(insights, conn)
+            logger.info("Hourly Ad Insights ETL step completed successfully")
+        except Exception as e:
+            logger.error(f"Hourly Ad Insights ETL step failed: {e}")
         logger.info("All ETL steps attempted")
     except Exception as e:
         logger.error(f"ETL script failed at connection/setup: {e}")
