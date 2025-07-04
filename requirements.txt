@@ -4,3 +4,4 @@ python-dotenv
 pytz
 azure-functions
 requests
+more_itertools
