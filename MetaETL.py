@@ -10,6 +10,8 @@ from urllib.parse import urlparse
 import pytz
 import re
 import time
+from more_itertools import chunked
+from datetime import timedelta
 
 # Configure logging
 logging.basicConfig(filename='metrics.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -129,8 +131,8 @@ CREATE_TABLES_SQL = [
     """
     CREATE TABLE IF NOT EXISTS dim_campaign (
         campaign_id VARCHAR(50) PRIMARY KEY,
-        account_id VARCHAR(50) NOT NULL,
-        campaign_name VARCHAR(255) NOT NULL,
+        account_id VARCHAR(50),
+        campaign_name VARCHAR(255),
         objective VARCHAR(50),
         status VARCHAR(20),
         buying_type VARCHAR(20),
@@ -140,8 +142,8 @@ CREATE_TABLES_SQL = [
         budget_remaining NUMERIC,
         daily_budget NUMERIC,
         lifetime_budget NUMERIC,
-        created_at TIMESTAMP NOT NULL,
-        updated_at TIMESTAMP NOT NULL,
+        created_at TIMESTAMP,
+        updated_at TIMESTAMP,
         hour VARCHAR(32),
         fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
@@ -248,7 +250,7 @@ CREATE_TABLES_SQL = [
         hour VARCHAR(32),
         fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         raw_data JSONB,
-        PRIMARY KEY (id, hour)
+        PRIMARY KEY (id)
     )
     """,
     """
@@ -317,19 +319,51 @@ def api_request_with_backoff(request_func, *args, **kwargs):
     delay = RATE_LIMIT_INTERVAL
     for attempt in range(max_retries):
         try:
-            return request_func(*args, **kwargs)
+            # Always set a timeout if not provided
+            if 'timeout' not in kwargs:
+                kwargs['timeout'] = 30
+            response = request_func(*args, **kwargs)
+        except requests.exceptions.Timeout:
+            logger.warning(f"Timeout (attempt {attempt+1}/{max_retries}), retrying in {delay} seconds...")
+            time.sleep(delay)
+            delay *= 2
+            continue
         except requests.exceptions.HTTPError as e:
             try:
                 error_json = e.response.json()
                 code = error_json.get('error', {}).get('code')
             except Exception:
                 code = None
-            if code == 80004:  # Rate limit error
+            if code == 80004 or e.response.status_code == 429:  # Rate limit error
                 logger.warning(f"Rate limit hit (attempt {attempt+1}/{max_retries}), retrying in {delay} seconds...")
                 time.sleep(delay)
-                delay *= 2  # Exponential backoff
+                delay *= 2
+                continue
             else:
                 raise
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Network error (attempt {attempt+1}/{max_retries}): {e}, retrying in {delay} seconds...")
+            time.sleep(delay)
+            delay *= 2
+            continue
+        # Respect X-App-Usage header
+        usage_header = response.headers.get("X-App-Usage")
+        if usage_header:
+            try:
+                usage = json.loads(usage_header)
+                if usage.get("call_count", 0) > 80:
+                    logger.warning("High API usage. Sleeping 60 seconds to cool down.")
+                    time.sleep(60)
+            except Exception:
+                pass
+        if response.status_code == 200:
+            return response
+        elif response.status_code == 429:
+            logger.warning(f"Rate limit hit (attempt {attempt+1}/{max_retries}), retrying in {delay} seconds...")
+            time.sleep(delay)
+            delay *= 2
+        else:
+            response.raise_for_status()
     logger.error(f"API rate limit error after {max_retries} retries, skipping step.")
     return None
 
@@ -448,6 +482,14 @@ def normalize_activity_datetime(dt_str):
 def upsert_activity_history(activities, conn):
     if not activities:
         return
+    # Deduplicate by (object_id, event_type, event_time, hour)
+    seen = set()
+    deduped_activities = []
+    for row in activities:
+        key = (row[0], row[3], row[8], row[9])  # object_id, event_type, event_time, hour
+        if key not in seen:
+            seen.add(key)
+            deduped_activities.append(row)
     cursor = conn.cursor()
     cursor.execute("SET TIME ZONE 'Asia/Kolkata';")
     query = """
@@ -464,9 +506,9 @@ def upsert_activity_history(activities, conn):
         fetched_at=EXCLUDED.fetched_at
     """
     try:
-        execute_values(cursor, query, activities)
+        execute_values(cursor, query, deduped_activities)
         conn.commit()
-        logger.info(f"Upserted {len(activities)} activity history records")
+        logger.info(f"Upserted {len(deduped_activities)} activity history records")
     except Exception as e:
         logger.error(f"Failed to upsert activity history: {str(e)}")
         raise
@@ -535,26 +577,59 @@ def upsert_regionwise_insights(rows, conn):
     finally:
         cursor.close()
 
+def get_existing_adcreative_updated_times(conn, creative_ids):
+    # Returns {id: updated_time} for adcreatives in DB for today
+    cursor = conn.cursor()
+    today = datetime.now(IST).date()
+    cursor.execute("""
+        SELECT id, updated_time
+        FROM ad_creatives
+        WHERE id = ANY(%s) AND DATE(updated_time) = %s
+    """, (list(creative_ids), today))
+    result = {row[0]: row[1] for row in cursor.fetchall()}
+    cursor.close()
+    return result
+
+def filter_new_or_changed_adcreatives(fetched_creatives, existing_updated_times):
+    today = datetime.now(IST).date()
+    filtered = []
+    for creative in fetched_creatives:
+        updated_time = creative[9]
+        if updated_time:
+            try:
+                updated_date = datetime.fromisoformat(updated_time.replace('Z', '+00:00')).astimezone(IST).date()
+            except Exception:
+                continue
+            if updated_date == today:
+                creative_id = creative[0]
+                db_time = existing_updated_times.get(creative_id)
+                if db_time is None or (updated_time and updated_time > db_time):
+                    filtered.append(creative)
+    return filtered
+
 def fetch_adcreatives_batch():
-    url = f"https://graph.facebook.com/v18.0/act_{ACCOUNT_ID}/adcreatives"
+    url = f"https://graph.facebook.com/v22.0/act_{ACCOUNT_ID}/adcreatives"
     params = {
-        "fields": "id,name,body,title,object_story_spec,call_to_action_type",
+        "fields": "id,name,body,title,object_story_spec,call_to_action_type,updated_time",
         "access_token": ACCESS_TOKEN,
-        "limit": 100
+        "limit": 50
     }
     all_creatives = []
     now_ist = datetime.now(IST)
     hour_str = now_ist.replace(minute=0, second=0, microsecond=0).isoformat()
     while url:
-        def do_request():
-            return requests.get(url, params=params)
+        def do_request(*args, **kwargs):
+            return requests.get(url, params=params, *args, **kwargs)
         response = api_request_with_backoff(do_request)
         if response is None:
             break
-        logger.info(f"Fetched adcreatives batch raw response: {response.text}")
+        try:
+            data = response.json()
+            logger.info(f"Fetched adcreatives batch with {len(data.get('data', []))} records")
+        except Exception:
+            logger.info("Fetched adcreatives batch (could not parse count)")
         time.sleep(RATE_LIMIT_INTERVAL)
         response.raise_for_status()
-        data = response.json()
         for item in data.get("data", []):
             logger.info(f"Fetched adcreative: {json.dumps(item)}")
             all_creatives.append((
@@ -566,7 +641,8 @@ def fetch_adcreatives_batch():
                 item.get('call_to_action_type'),
                 hour_str,
                 now_ist,
-                json.dumps(item)
+                json.dumps(item),
+                item.get('updated_time')
             ))
         url = data.get("paging", {}).get("next")
         params = {}  # Clear params for next page (URL already has them)
@@ -601,25 +677,78 @@ def upsert_adcreatives(creatives, conn):
     finally:
         cursor.close()
 
+def get_existing_adset_updated_times(conn, adset_ids):
+    # Returns {adset_id: updated_time} for adsets in DB for today
+    cursor = conn.cursor()
+    today = datetime.now(IST).date()
+    cursor.execute("""
+        SELECT id, updated_time
+        FROM adsets
+        WHERE id = ANY(%s) AND DATE(updated_time) = %s
+    """, (list(adset_ids), today))
+    result = {row[0]: row[1] for row in cursor.fetchall()}
+    cursor.close()
+    return result
+
+def filter_new_or_changed_adsets(fetched_adsets, existing_updated_times):
+    today = datetime.now(IST).date()
+    filtered = []
+    for adset in fetched_adsets:
+        updated_time = adset[15]
+        if updated_time:
+            try:
+                updated_date = datetime.fromisoformat(updated_time.replace('Z', '+00:00')).astimezone(IST).date()
+            except Exception:
+                continue
+            if updated_date == today:
+                adset_id = adset[0]
+                db_time = existing_updated_times.get(adset_id)
+                # Ensure both are offset-aware datetimes for comparison
+                try:
+                    updated_time_dt = datetime.fromisoformat(updated_time.replace('Z', '+00:00')).astimezone(IST)
+                except Exception:
+                    continue
+                if db_time is None:
+                    filtered.append(adset)
+                else:
+                    if isinstance(db_time, str):
+                        try:
+                            db_time_dt = datetime.fromisoformat(db_time.replace('Z', '+00:00')).astimezone(IST)
+                        except Exception:
+                            continue
+                    else:
+                        # If db_time is naive, localize it to IST
+                        if db_time.tzinfo is None:
+                            db_time_dt = db_time.replace(tzinfo=IST)
+                        else:
+                            db_time_dt = db_time.astimezone(IST)
+                    if updated_time_dt > db_time_dt:
+                        filtered.append(adset)
+    return filtered
+
 def fetch_adsets_batch():
-    url = f"https://graph.facebook.com/v20.0/act_{ACCOUNT_ID}/adsets"
+    url = f"https://graph.facebook.com/v22.0/act_{ACCOUNT_ID}/adsets"
     params = {
         "fields": "optimization_goal,updated_time,billing_event,bid_strategy,lifetime_spend_cap,daily_spend_cap,learning_stage_info,effective_status,lifetime_min_spend_target,destination_type,bid_adjustments,bid_amount,id,daily_min_spend_target,campaign_id,pacing_type,created_time,attribution_spec,issues_info,lifetime_budget,creative_sequence,adset_schedule,end_time,daily_budget,is_dynamic_creative,start_time,account_id,adlabels,budget_remaining,promoted_object,name,bid_constraints,targeting{geo_locations,keywords,genders,age_min,age_max,relationship_statuses,countries,locales,device_platforms,effective_device_platforms,publisher_platforms,effective_publisher_platforms,facebook_positions,effective_facebook_positions,instagram_positions,effective_instagram_positions,audience_network_positions,effective_audience_network_positions,messenger_positions,effective_messenger_positions,education_statuses,user_adclusters,excluded_geo_locations,interested_in,interests,behaviors,connections,excluded_connections,friends_of_connections,user_os,user_device,excluded_user_device,app_install_state,wireless_carrier,site_category,college_years,work_employers,work_positions,education_majors,life_events,politics,income,home_type,home_value,ethnic_affinity,generation,household_composition,moms,office_type,family_statuses,net_worth,home_ownership,industries,education_schools,custom_audiences,excluded_custom_audiences,dynamic_audience_ids,product_audience_specs,excluded_product_audience_specs,flexible_spec,exclusions,excluded_publisher_categories,excluded_publisher_list_ids,place_page_set_ids,targeting_optimization,brand_safety_content_filter_levels,is_whatsapp_destination_ad,instream_video_skippable_excluded,targeting_relaxation_types},status,rf_prediction_id,time_based_ad_rotation_id_blocks,time_based_ad_rotation_intervals,frequency_control_specs",
-        "access_token": ACCESS_TOKEN
+        "access_token": ACCESS_TOKEN,
+        "limit": 50
     }
     all_adsets = []
     now_ist = datetime.now(IST)
     hour_str = now_ist.replace(minute=0, second=0, microsecond=0).isoformat()
     while url:
-        def do_request():
-            return requests.get(url, params=params)
+        def do_request(*args, **kwargs):
+            return requests.get(url, params=params, *args, **kwargs)
         response = api_request_with_backoff(do_request)
         if response is None:
             break
-        logger.info(f"Fetched adsets batch raw response: {response.text}")
+        try:
+            data = response.json()
+            logger.info(f"Fetched adsets batch with {len(data.get('data', []))} records")
+        except Exception:
+            logger.info("Fetched adsets batch (could not parse count)")
         time.sleep(RATE_LIMIT_INTERVAL)
         response.raise_for_status()
-        data = response.json()
         for item in data.get("data", []):
             logger.info(f"Fetched adset: {json.dumps(item)}")
             all_adsets.append((
@@ -745,7 +874,7 @@ def upsert_adsets(adsets, conn):
         cursor.close()
 
 def fetch_ads_batch():
-    url = f"https://graph.facebook.com/v18.0/act_{ACCOUNT_ID}"
+    url = f"https://graph.facebook.com/v22.0/act_{ACCOUNT_ID}"
     params = {
         "fields": "ads{id,name,adset_id,targeting{age_min,age_max,genders,geo_locations,device_platforms,publisher_platforms},insights.date_preset(maximum){impressions,clicks,ctr,spend,actions,action_values,conversion_rate_ranking,purchase_roas,mobile_app_purchase_roas}}",
         "access_token": ACCESS_TOKEN
@@ -754,16 +883,19 @@ def fetch_ads_batch():
     now_ist = datetime.now(IST)
     hour_str = now_ist.replace(minute=0, second=0, microsecond=0).isoformat()
     while url:
-        def do_request():
-            return requests.get(url, params=params)
+        def do_request(*args, **kwargs):
+            return requests.get(url, params=params, *args, **kwargs)
         response = api_request_with_backoff(do_request)
         if response is None:
             break
-        logger.info(f"Fetched ads batch raw response: {response.text}")
+        try:
+            data = response.json()
+            ads_data = data.get("ads", {}).get("data", [])
+            logger.info(f"Fetched ads batch with {len(ads_data)} records")
+        except Exception:
+            logger.info("Fetched ads batch (could not parse count)")
         time.sleep(RATE_LIMIT_INTERVAL)
         response.raise_for_status()
-        data = response.json()
-        ads_data = data.get("ads", {}).get("data", [])
         for item in ads_data:
             logger.info(f"Fetched ad: {json.dumps(item)}")
             all_ads.append((
@@ -790,11 +922,12 @@ def upsert_ads(ads, conn):
     INSERT INTO ads (
         id, name, adset_id, targeting, insights, hour, fetched_at, raw_data
     ) VALUES %s
-    ON CONFLICT (id, hour) DO UPDATE SET
+    ON CONFLICT (id) DO UPDATE SET
         name=EXCLUDED.name,
         adset_id=EXCLUDED.adset_id,
         targeting=EXCLUDED.targeting,
         insights=EXCLUDED.insights,
+        hour=EXCLUDED.hour,
         fetched_at=EXCLUDED.fetched_at,
         raw_data=EXCLUDED.raw_data
     """
@@ -811,44 +944,139 @@ def upsert_ads(ads, conn):
 def fetch_ad_insights(ad_ids):
     if not ad_ids:
         return []
-    url = f"{BASE_URL}/act_{ACCOUNT_ID}/insights"
-    params = {
-        'access_token': ACCESS_TOKEN,
-        'level': 'ad',
-        'filtering': json.dumps([{'field': 'ad.id', 'operator': 'IN', 'value': ad_ids}]),
-        'date_preset': 'today',
-        'action_breakdowns': 'action_type',
-        'fields': 'ad_id,adset_id,campaign_id,account_id,date_start,date_stop,clicks,impressions,spend,reach,actions,action_values,outbound_clicks,ctr,cpp,video_p25_watched_actions,video_thruplay_watched_actions'
-    }
-    try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        data = response.json().get('data', [])
-        processed_insights = []
-        for insight in data:
-            # Convert string values to correct types
+    from more_itertools import chunked
+    from datetime import timedelta
+    all_insights = []
+    failed_batches = []
+    batch_size = 50
+    # Calculate IST day boundaries and convert to UTC
+    today_ist = datetime.now(IST).date()
+    utc_since = today_ist.strftime("%Y-%m-%d")
+    utc_until = today_ist.strftime("%Y-%m-%d")
+    for chunk in chunked(ad_ids, batch_size):
+        params = {
+            'access_token': ACCESS_TOKEN,
+            'level': 'ad',
+            'time_range': json.dumps({
+                'since': utc_since,
+                'until': utc_until
+            }),
+            'time_increment': 1,
+            'filtering': json.dumps([{'field': 'ad.id', 'operator': 'IN', 'value': chunk}]),
+            'fields': 'ad_id,adset_id,campaign_id,account_id,date_start,date_stop,clicks,impressions,spend,reach,actions,action_values,outbound_clicks,ctr,cpp,video_p25_watched_actions,video_thruplay_watched_actions'
+        }
+        try:
+            response = api_request_with_backoff(requests.get, f"{BASE_URL}/act_{ACCOUNT_ID}/insights", params=params)
+            if response is None:
+                raise Exception("All retries failed")
             try:
-                if 'clicks' in insight:
-                    insight['clicks'] = int(insight['clicks']) if insight['clicks'] else 0
-                if 'impressions' in insight:
-                    insight['impressions'] = int(insight['impressions']) if insight['impressions'] else 0
-                if 'reach' in insight:
-                    insight['reach'] = int(insight['reach']) if insight['reach'] else 0
-                if 'spend' in insight:
-                    insight['spend'] = float(insight['spend']) if insight['spend'] else 0.0
-                if 'ctr' in insight:
-                    insight['ctr'] = float(insight['ctr']) if insight['ctr'] else 0.0
-                if 'cpp' in insight:
-                    insight['cpp'] = float(insight['cpp']) if insight['cpp'] else 0.0
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Type conversion failed for insight {insight.get('ad_id', 'unknown')}: {e}")
-                continue  # Skip insight if conversion fails
+                data = response.json().get("data", [])
+            except Exception:
+                logger.warning("Failed to parse ad insights response JSON.")
+                continue
+            logger.info(f"Fetched {len(data)} ad insights in batch")
+            all_insights.extend(data)
+            time.sleep(RATE_LIMIT_INTERVAL)
+        except Exception as e:
+            logger.error(f"Batch failed for ad_ids {chunk}: {e}")
+            failed_batches.append(chunk)
+            continue
+    # Optionally, retry failed batches once more at the end
+    for chunk in failed_batches:
+        params = {
+            'access_token': ACCESS_TOKEN,
+            'level': 'ad',
+            'time_range': json.dumps({
+                'since': utc_since,
+                'until': utc_until
+            }),
+            'time_increment': 1,
+            'filtering': json.dumps([{'field': 'ad.id', 'operator': 'IN', 'value': chunk}]),
+            'fields': 'ad_id,adset_id,campaign_id,account_id,date_start,date_stop,clicks,impressions,spend,reach,actions,action_values,outbound_clicks,ctr,cpp,video_p25_watched_actions,video_thruplay_watched_actions'
+        }
+        try:
+            logger.info(f"Retrying failed batch for ad_ids {chunk}")
+            response = api_request_with_backoff(requests.get, f"{BASE_URL}/act_{ACCOUNT_ID}/insights", params=params)
+            if response is None:
+                logger.error(f"Final retry failed for ad_ids {chunk}")
+                continue
+            try:
+                data = response.json().get("data", [])
+            except Exception:
+                logger.warning("Failed to parse ad insights response JSON on retry.")
+                continue
+            logger.info(f"Fetched {len(data)} ad insights in retry batch")
+            all_insights.extend(data)
+            time.sleep(RATE_LIMIT_INTERVAL)
+        except Exception as e:
+            logger.error(f"Final retry failed for ad_ids {chunk}: {e}")
+            continue
+    # Type conversion and extraction for all required metrics
+    def extract_action_value(actions, key):
+        if not actions:
+            return 0
+        for action in actions:
+            if action.get('action_type') == key:
+                try:
+                    return int(action.get('value', 0))
+                except Exception:
+                    try:
+                        return float(action.get('value', 0))
+                    except Exception:
+                        return 0
+        return 0
+    def extract_action_value_float(actions, key):
+        if not actions:
+            return 0.0
+        for action in actions:
+            if action.get('action_type') == key:
+                try:
+                    return float(action.get('value', 0))
+                except Exception:
+                    return 0.0
+        return 0.0
+    processed_insights = []
+    for insight in all_insights:
+        try:
+            # Basic type conversions
+            if 'clicks' in insight:
+                insight['clicks'] = int(insight['clicks']) if insight['clicks'] else 0
+            if 'impressions' in insight:
+                insight['impressions'] = int(insight['impressions']) if insight['impressions'] else 0
+            if 'reach' in insight:
+                insight['reach'] = int(insight['reach']) if insight['reach'] else 0
+            if 'spend' in insight:
+                insight['spend'] = float(insight['spend']) if insight['spend'] else 0.0
+            if 'ctr' in insight:
+                insight['ctr'] = float(insight['ctr']) if insight['ctr'] else 0.0
+            if 'cpp' in insight:
+                insight['cpp'] = float(insight['cpp']) if insight['cpp'] else 0.0
+            # Extract metrics from nested fields
+            actions = insight.get('actions', [])
+            action_values = insight.get('action_values', [])
+            outbound_clicks = insight.get('outbound_clicks', [])
+            video_p25 = insight.get('video_p25_watched_actions', [])
+            video_thruplay = insight.get('video_thruplay_watched_actions', [])
+            insight['page_engagement'] = extract_action_value(actions, 'page_engagement')
+            insight['post_engagement'] = extract_action_value(actions, 'post_engagement')
+            insight['video_view'] = extract_action_value(actions, 'video_view')
+            insight['landing_page_view'] = extract_action_value(actions, 'landing_page_view')
+            insight['purchase'] = extract_action_value(actions, 'purchase')
+            insight['add_to_cart'] = extract_action_value(actions, 'add_to_cart')
+            insight['link_click'] = extract_action_value(actions, 'link_click')
+            insight['post_reaction'] = extract_action_value(actions, 'post_reaction')
+            insight['outbound_click'] = extract_action_value(outbound_clicks, 'outbound_click')
+            insight['purchase_value'] = extract_action_value_float(action_values, 'purchase')
+            insight['view_content_value'] = extract_action_value_float(action_values, 'view_content')
+            insight['add_to_cart_value'] = extract_action_value_float(action_values, 'add_to_cart')
+            insight['video_p25_watched'] = extract_action_value(video_p25, 'video_view')
+            insight['video_thruplay_watched'] = extract_action_value(video_thruplay, 'video_view')
             processed_insights.append(insight)
-        logger.info(f"Fetched {len(processed_insights)} insights (validation deferred)")
-        return processed_insights
-    except Exception as e:
-        logger.error(f"Error fetching ad insights: {e}")
-        return []
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Type conversion failed for insight {insight.get('ad_id', 'unknown')}: {e}")
+            continue
+    logger.info(f"Fetched {len(processed_insights)} insights (validation deferred)")
+    return processed_insights
 
 def upsert_hourly_ad_insights(insights, conn):
     if not insights:
@@ -929,6 +1157,22 @@ def upsert_hourly_ad_insights(insights, conn):
     finally:
         cursor.close()
 
+def etl_adsets(conn):
+    adsets = fetch_adsets_batch()
+    adset_ids = [a[0] for a in adsets]
+    existing_times = get_existing_adset_updated_times(conn, adset_ids)
+    filtered_adsets = filter_new_or_changed_adsets(adsets, existing_times)
+    upsert_adsets(filtered_adsets, conn)
+    logger.info(f"Upserted {len(filtered_adsets)} changed/new adsets out of {len(adsets)} fetched.")
+
+def etl_adcreatives(conn):
+    adcreatives = fetch_adcreatives_batch()
+    creative_ids = [a[0] for a in adcreatives]
+    existing_times = get_existing_adcreative_updated_times(conn, creative_ids)
+    filtered_creatives = filter_new_or_changed_adcreatives(adcreatives, existing_times)
+    upsert_adcreatives(filtered_creatives, conn)
+    logger.info(f"Upserted {len(filtered_creatives)} changed/new adcreatives out of {len(adcreatives)} fetched.")
+
 def main():
     setup_database()
     conn = None
@@ -937,72 +1181,8 @@ def main():
         conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute("SET TIME ZONE 'Asia/Kolkata';")
-        # Campaign ETL
-        try:
-            logger.info("Starting Campaign ETL step")
-            campaigns = fetch_campaigns()
-            with conn.cursor() as cur:
-                execute_values(cur, """
-                    INSERT INTO dim_campaign (
-                        campaign_id, account_id, campaign_name, objective, status, buying_type,
-                        special_ad_categories, start_time, end_time, budget_remaining,
-                        daily_budget, lifetime_budget, created_at, updated_at, hour, fetched_at
-                    )
-                    VALUES %s
-                    ON CONFLICT (campaign_id) DO UPDATE SET
-                        account_id=EXCLUDED.account_id,
-                        campaign_name=EXCLUDED.campaign_name,
-                        objective=EXCLUDED.objective,
-                        status=EXCLUDED.status,
-                        buying_type=EXCLUDED.buying_type,
-                        special_ad_categories=EXCLUDED.special_ad_categories,
-                        start_time=EXCLUDED.start_time,
-                        end_time=EXCLUDED.end_time,
-                        budget_remaining=EXCLUDED.budget_remaining,
-                        daily_budget=EXCLUDED.daily_budget,
-                        lifetime_budget=EXCLUDED.lifetime_budget,
-                        updated_at=EXCLUDED.updated_at,
-                        hour=EXCLUDED.hour,
-                        fetched_at=EXCLUDED.fetched_at
-                """, campaigns)
-            logger.info("Campaign ETL step completed successfully")
-        except Exception as e:
-            logger.error(f"Campaign ETL step failed: {e}")
-        # Activity History ETL
-        try:
-            logger.info("Starting Activity History ETL step")
-            today_ist = datetime.now(IST).date().isoformat()
-            activities = fetch_activity_history(since=today_ist, until=today_ist)
-            upsert_activity_history(activities, conn)
-            logger.info("Activity History ETL step completed successfully")
-        except Exception as e:
-            logger.error(f"Activity History ETL step failed: {e}")
-        # Regionwise Insights ETL
-        try:
-            logger.info("Starting Regionwise Insights ETL step")
-            regionwise_insights = fetch_regionwise_insights()
-            upsert_regionwise_insights(regionwise_insights, conn)
-            logger.info("Regionwise Insights ETL step completed successfully")
-        except Exception as e:
-            logger.error(f"Regionwise Insights ETL step failed: {e}")
-        # AdCreatives ETL
-        try:
-            logger.info("Starting AdCreatives ETL step")
-            adcreatives = fetch_adcreatives_batch()
-            upsert_adcreatives(adcreatives, conn)
-            logger.info("AdCreatives ETL step completed successfully")
-        except Exception as e:
-            logger.error(f"AdCreatives ETL step failed: {e}")
-        # AdSets ETL
-        try:
-            logger.info("Starting AdSets ETL step")
-            adsets = fetch_adsets_batch()
-            adsets = filter_adsets_with_existing_campaigns(adsets, conn)
-            upsert_adsets(adsets, conn)
-            logger.info("AdSets ETL step completed successfully")
-        except Exception as e:
-            logger.error(f"AdSets ETL step failed: {e}")
-        # Ads ETL
+        # --- PRIORITIZE ESSENTIAL BATCHES FIRST ---
+        # 1. Ads ETL
         try:
             logger.info("Starting Ads ETL step")
             ads = fetch_ads_batch()
@@ -1011,8 +1191,7 @@ def main():
         except Exception as e:
             logger.error(f"Ads ETL step failed: {e}")
             ads = []  # Ensure ads is always defined
-
-        # Hourly Ad Insights ETL (direct to snapshots)
+        # 2. Hourly Ad Insights ETL (direct to snapshots)
         try:
             logger.info("Starting Hourly Ad Insights ETL step (direct to ad_insights_hourly_snapshots)")
             insights = fetch_ad_insights([a[0] for a in ads])
@@ -1057,6 +1236,71 @@ def main():
             logger.info("Hourly Ad Insights ETL step completed successfully")
         except Exception as e:
             logger.error(f"Hourly Ad Insights ETL step failed: {e}")
+        # 3. Regionwise Insights ETL
+        try:
+            logger.info("Starting Regionwise Insights ETL step")
+            regionwise_insights = fetch_regionwise_insights()
+            upsert_regionwise_insights(regionwise_insights, conn)
+            logger.info("Regionwise Insights ETL step completed successfully")
+        except Exception as e:
+            logger.error(f"Regionwise Insights ETL step failed: {e}")
+        # --- OTHER BATCHES ---
+        # 4. Campaign ETL
+        try:
+            logger.info("Starting Campaign ETL step")
+            campaigns = fetch_campaigns()
+            with conn.cursor() as cur:
+                execute_values(cur, """
+                    INSERT INTO dim_campaign (
+                        campaign_id, account_id, campaign_name, objective, status, buying_type,
+                        special_ad_categories, start_time, end_time, budget_remaining,
+                        daily_budget, lifetime_budget, created_at, updated_at, hour, fetched_at
+                    )
+                    VALUES %s
+                    ON CONFLICT (campaign_id) DO UPDATE SET
+                        account_id=EXCLUDED.account_id,
+                        campaign_name=EXCLUDED.campaign_name,
+                        objective=EXCLUDED.objective,
+                        status=EXCLUDED.status,
+                        buying_type=EXCLUDED.buying_type,
+                        special_ad_categories=EXCLUDED.special_ad_categories,
+                        start_time=EXCLUDED.start_time,
+                        end_time=EXCLUDED.end_time,
+                        budget_remaining=EXCLUDED.budget_remaining,
+                        daily_budget=EXCLUDED.daily_budget,
+                        lifetime_budget=EXCLUDED.lifetime_budget,
+                        updated_at=EXCLUDED.updated_at,
+                        hour=EXCLUDED.hour,
+                        fetched_at=EXCLUDED.fetched_at
+                """, campaigns)
+            logger.info("Campaign ETL step completed successfully")
+        except Exception as e:
+            logger.error(f"Campaign ETL step failed: {e}")
+        # 5. AdCreatives ETL
+        try:
+            logger.info("Starting AdCreatives ETL step")
+            etl_adcreatives(conn)
+            logger.info("AdCreatives ETL step completed successfully")
+        except Exception as e:
+            logger.error(f"AdCreatives ETL step failed: {e}")
+        # 6. AdSets ETL
+        try:
+            logger.info("Starting AdSets ETL step")
+            etl_adsets(conn)
+            logger.info("AdSets ETL step completed successfully")
+        except Exception as e:
+            logger.error(f"AdSets ETL step failed: {e}")
+        # 7. Activity History ETL
+        try:
+            logger.info("Starting Activity History ETL step")
+            today_ist = datetime.now(IST).date().isoformat()
+            since = f"{today_ist}T00:00:00"
+            until = f"{today_ist}T23:59:59"
+            activities = fetch_activity_history(since=since, until=until)
+            upsert_activity_history(activities, conn)
+            logger.info("Activity History ETL step completed successfully")
+        except Exception as e:
+            logger.error(f"Activity History ETL step failed: {e}")
         logger.info("All ETL steps attempted")
     except Exception as e:
         logger.error(f"ETL script failed at connection/setup: {e}")
