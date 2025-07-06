@@ -677,55 +677,6 @@ def upsert_adcreatives(creatives, conn):
     finally:
         cursor.close()
 
-def get_existing_adset_updated_times(conn, adset_ids):
-    # Returns {adset_id: updated_time} for adsets in DB for today
-    cursor = conn.cursor()
-    today = datetime.now(IST).date()
-    cursor.execute("""
-        SELECT id, updated_time
-        FROM adsets
-        WHERE id = ANY(%s) AND DATE(updated_time) = %s
-    """, (list(adset_ids), today))
-    result = {row[0]: row[1] for row in cursor.fetchall()}
-    cursor.close()
-    return result
-
-def filter_new_or_changed_adsets(fetched_adsets, existing_updated_times):
-    today = datetime.now(IST).date()
-    filtered = []
-    for adset in fetched_adsets:
-        updated_time = adset[15]
-        if updated_time:
-            try:
-                updated_date = datetime.fromisoformat(updated_time.replace('Z', '+00:00')).astimezone(IST).date()
-            except Exception:
-                continue
-            if updated_date == today:
-                adset_id = adset[0]
-                db_time = existing_updated_times.get(adset_id)
-                # Ensure both are offset-aware datetimes for comparison
-                try:
-                    updated_time_dt = datetime.fromisoformat(updated_time.replace('Z', '+00:00')).astimezone(IST)
-                except Exception:
-                    continue
-                if db_time is None:
-                    filtered.append(adset)
-                else:
-                    if isinstance(db_time, str):
-                        try:
-                            db_time_dt = datetime.fromisoformat(db_time.replace('Z', '+00:00')).astimezone(IST)
-                        except Exception:
-                            continue
-                    else:
-                        # If db_time is naive, localize it to IST
-                        if db_time.tzinfo is None:
-                            db_time_dt = db_time.replace(tzinfo=IST)
-                        else:
-                            db_time_dt = db_time.astimezone(IST)
-                    if updated_time_dt > db_time_dt:
-                        filtered.append(adset)
-    return filtered
-
 def fetch_adsets_batch():
     url = f"https://graph.facebook.com/v22.0/act_{ACCOUNT_ID}/adsets"
     params = {
